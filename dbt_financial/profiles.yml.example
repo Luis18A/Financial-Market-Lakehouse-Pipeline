@@ -1,0 +1,12 @@
+financial_dw:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: postgres
+      user: postgres
+      password: postgrespassword
+      port: 5432
+      dbname: financial_dw
+      schema: gold
+      threads: 4
