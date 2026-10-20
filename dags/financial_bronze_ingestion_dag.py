@@ -164,15 +164,62 @@ def financial_bronze_ingestion_pipeline():
             "✅ Verificación exitosa de la Capa Bronze. Total de archivos ingestados: %d",
             total_ingested,
         )
+        return True
 
+    @task(task_id="trigger_spark_silver_processing")
+    def run_spark_silver() -> dict:
+        """
+        Dispara el procesamiento masivo distribuido en Apache Spark (PySpark)
+        para limpiar, tipar y calcular indicadores financieros hacia la Capa Silver.
+        """
+        import requests
+
+        spark_runner_url = "http://spark-master:5050/run-silver"
+        logger.info("Enviando orden de ejecución a Apache Spark: %s...", spark_runner_url)
+
+        try:
+            response = requests.post(spark_runner_url, timeout=300)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("status") != "SUCCESS":
+                raise RuntimeError(f"Fallo en PySpark Job: {data}")
+            logger.info("PySpark Job finalizado exitosamente.")
+            return data
+        except Exception as e:
+            logger.error("Error al ejecutar job en cluster Spark: %s", e)
+            raise
+
+    @task(task_id="verify_silver_layer")
+    def verify_silver_layer() -> bool:
+        """
+        Audita que los conjuntos de datos en formato Parquet existan físicamente en s3://silver/.
+        """
+        storage = MinIOStorage()
+        objects = storage.list_objects("silver")
+        logger.info("Total de objetos encontrados en s3://silver/: %d", len(objects))
+
+        has_prices = any("stock_prices" in obj for obj in objects)
+        has_listings = any("company_listings" in obj for obj in objects)
+
+        if not (has_prices and has_listings):
+            raise FileNotFoundError(
+                "No se encontraron los artefactos Parquet esperados en s3://silver/."
+            )
+
+        logger.info(
+            "✅ Capa Silver auditada con éxito: datasets de precios y catálogo de empresas listos en Parquet."
+        )
+        return True
 
     # Definición de dependencias en el Grafo (DAG)
     minio_ok = check_minio()
     listing_task = ingest_listing_status()
     series_task = ingest_stock_time_series()
-    verification = verify_bronze_layer(listing_task, series_task)
+    bronze_verification = verify_bronze_layer(listing_task, series_task)
+    spark_silver = run_spark_silver()
+    silver_verification = verify_silver_layer()
 
-    minio_ok >> [listing_task, series_task] >> verification
+    minio_ok >> [listing_task, series_task] >> bronze_verification >> spark_silver >> silver_verification
 
 
 # Instanciación del DAG

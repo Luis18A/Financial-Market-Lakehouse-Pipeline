@@ -72,7 +72,8 @@ Financial-Market-Lakehouse-Pipeline/
 │       └── Dockerfile        # Compilación multi-stage de MinIO desde código fuente oficial
 │
 ├── spark_jobs/               # Scripts PySpark de procesamiento masivo (Capa Silver)
-│   └── .gitkeep
+│   ├── bronze_to_silver.py   # Job distribuido: limpieza, tipado, métricas de ventana y Parquet
+│   └── spark_server.py       # Servidor despachador REST para orquestación desacoplada desde Airflow
 │
 ├── dbt_financial/            # Proyecto dbt Core (Capa Gold y Data Quality)
 │   ├── dbt_project.yml       # Configuración global del proyecto dbt
@@ -249,7 +250,57 @@ Para garantizar lecturas de alta eficiencia en la capa Silver sin escanear datos
 
 ---
 
-## 8. Comandos Útiles de Mantenimiento
+## 8. Capa Silver: Procesamiento Distribuido y Limpieza con Apache Spark (PySpark)
+
+La **Capa Silver** transforma los datos crudos, inconsistentes y semiestructurados de la capa Bronze en conjuntos de datos limpios, tipados, deduplicados y enriquecidos con métricas analíticas cuantitativas.
+
+```
+┌─────────────────────────────────┐       ┌──────────────────────────────────────────────┐       ┌─────────────────────────────────┐
+│           CAPA BRONZE           │       │             CLUSTER APACHE SPARK             │       │           CAPA SILVER           │
+│           (Raw Data)            │       │      (Master + Worker Distribuido)           │       │       (Curated Parquet)         │
+│                                 │       │                                              │       │                                 │
+│ • JSONs multi-línea con fechas  │──────▶│ 1. wholeTextFiles + flatMap resiliente       │──────▶│ • s3://silver/stock_prices/     │
+│   dinámicas (Precios)           │       │ 2. Deduplicación por (symbol, trade_date)    │       │   (Parquet particionado Snappy) │
+│ • CSV de catálogo (Empresas)    │       │ 3. Window Functions (Retornos, MA-7d, Rango) │       │ • s3://silver/company_listings/ │
+│                                 │       │ 4. Tipado estricto (Date, Double, Long)      │       │   (Parquet consolidado)         │
+└─────────────────────────────────┘       └──────────────────────────────────────────────┘       └─────────────────────────────────┘
+                                                                 ▲
+                                                                 │ HTTP POST /run-silver (Puerto 5050)
+                                                  ┌──────────────┴───────────────┐
+                                                  │ APACHE AIRFLOW (Orquestador) │
+                                                  └──────────────────────────────┘
+```
+
+### Componentes de Ingeniería de la Capa Silver:
+1. **Job PySpark Distribuido ([`spark_jobs/bronze_to_silver.py`](file:///c:/Users/luisC/Music/DataEngineer/Financial-Market-Lakehouse-Pipeline/spark_jobs/bronze_to_silver.py))**:
+   - **Parseo de JSON con Fechas Dinámicas**: En lugar de depender de esquemas fijos que fallan ante claves mutables en el JSON de Alpha Vantage, Spark utiliza `wholeTextFiles` y `flatMap` distribuido para aplanar la estructura sin pérdida de registros.
+   - **Casting y Tipado Estricto**: Convierte cadenas de texto en tipos de datos nativos de bajo consumo de memoria (`DateType`, `DoubleType`, `LongType`).
+   - **Cálculo de Indicadores Bursátiles (Funciones de Ventana)**:
+     * `previous_close`: Cierre de la jornada bursátil anterior usando `lag()`.
+     * `daily_return_pct`: Variación porcentual diaria: `((adjusted_close - prev_close) / prev_close) * 100`.
+     * `daily_price_spread`: Amplitud del precio en la jornada: `high_price - low_price`.
+     * `is_positive_day`: Indicador booleano de vela alcista (`close >= open`).
+     * `moving_avg_7d`: Media móvil simple de 7 sesiones usando ventana deslizante `rowsBetween(-6, 0)`.
+   - **Formato Columnar Parquet con Compresión Snappy**: El almacenamiento columnar reduce drásticamente el espacio en disco y acelera las consultas analíticas al permitir proyecciones selectivas de columnas.
+
+2. **Microservicio Despachador REST ([`spark_jobs/spark_server.py`](file:///c:/Users/luisC/Music/DataEngineer/Financial-Market-Lakehouse-Pipeline/spark_jobs/spark_server.py))**:
+   - **Desacople Seguro entre Contenedores**: En lugar de exponer el socket de Docker (`/var/run/docker.sock`) dentro de Airflow (lo cual violaría principios de seguridad y generaría problemas de permisos en entornos multi-plataforma), Spark Master corre un servidor HTTP ligero en el puerto `5050`.
+   - Airflow dispara el trabajo mediante una petición HTTP `POST http://spark-master:5050/run-silver`, desacoplando completamente la orquestación del motor de ejecución.
+
+3. **Orquestación en Airflow ([`dags/financial_bronze_ingestion_dag.py`](file:///c:/Users/luisC/Music/DataEngineer/Financial-Market-Lakehouse-Pipeline/dags/financial_bronze_ingestion_dag.py))**:
+   El DAG une ambas capas en un pipeline automatizado:
+   ```text
+   check_minio >> [ingest_listing, ingest_stocks] >> verify_bronze >> trigger_spark_silver >> verify_silver
+   ```
+
+### Evidencia de Ejecución Verificada:
+* **Catálogo de Empresas Procesadas**: `14,510` empresas y activos catalogados y guardados en `s3a://silver/financial_market/company_listings/`.
+* **Series de Precios Enriquecidas**: `50` registros históricos procesados con indicadores cuantitativos y guardados en `s3a://silver/financial_market/stock_prices/symbol=.../`.
+* **Archivos generados**: Formato `.snappy.parquet` con confirmación de éxito `_SUCCESS`.
+
+---
+
+## 9. Comandos Útiles de Mantenimiento
 
 ```bash
 # Ver los logs en tiempo real de todos los servicios
@@ -257,6 +308,9 @@ docker compose logs -f
 
 # Ver los logs únicamente de Airflow
 docker compose logs -f airflow-webserver
+
+# Ver los logs del Master de Spark
+docker compose logs -f spark-master
 
 # Detener todos los servicios sin borrar datos almacenados
 docker compose stop
@@ -273,15 +327,13 @@ docker compose down -v
 
 ---
 
-## 9. Hoja de Ruta para las Siguientes Fases
+## 10. Hoja de Ruta para las Siguientes Fases
 
-Con la Capa Bronze implementada, el avance del Lakehouse continúa con:
+Con las Capas **Bronze** y **Silver** operativas y validadas, el pipeline avanzará hacia:
 
-1. **Fase 3 - Capa Silver (Data Processing con PySpark)**:
-   - Scripts de PySpark ejecutados en el cluster Spark.
-   - Limpieza, cálculo de variaciones porcentuales, casting de tipos y persistencia en `s3://silver/` en formato Parquet optimizado.
-2. **Fase 4 - Capa Gold (Data Modeling con dbt Core)**:
-   - Ingesta a `financial_dw` y modelado dimensional (tablas de hechos e indicadores financieros).
-   - Pruebas de calidad y linaje con `dbt test`.
-3. **Fase 5 - Orquestación Final**:
-   - Ensamblado del DAG integral en Airflow con alertas y monitoreo.
+1. **Fase 4 - Capa Gold (Data Modeling con dbt Core + PostgreSQL)**:
+   - Ingesta de las tablas limpias de Silver al Data Warehouse analítico `financial_dw`.
+   - Modelado dimensional Kimball (Tablas de Hechos de rendimiento accionario y Dimensiones de empresas/fechas).
+   - Pruebas de calidad y contratos de datos con `dbt test` (unicidad, no-nulidad, valores referenciales).
+2. **Fase 5 - Orquestación Integral y CI/CD**:
+   - Ensamblado final del DAG en Airflow: Ingesta (Bronze) ➔ Spark Job (Silver) ➔ dbt Run (Gold) ➔ dbt Test (Data Quality).
