@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: staging_raw
+    schema: staging
+    description: "Tablas origen cargadas desde los Parquets limpios de la Capa Silver (MinIO)"
+    tables:
+      - name: raw_stock_prices
+        description: "Series temporales diarias con indicadores financieros calculados por PySpark"
+      - name: raw_company_listings
+        description: "Catálogo maestro de empresas, tickers y activos financieros de Alpha Vantage"

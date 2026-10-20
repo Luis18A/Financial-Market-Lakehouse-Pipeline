@@ -1,0 +1,66 @@
+version: 2
+
+models:
+  - name: dim_companies
+    description: "Dimensión de empresas y catálogo de cotizaciones"
+    columns:
+      - name: company_key
+        description: "Clave sustituta (MD5 de symbol)"
+        tests:
+          - unique
+          - not_null
+      - name: symbol
+        tests:
+          - unique
+          - not_null
+
+  - name: dim_date
+    description: "Dimensión de calendario para análisis temporal"
+    columns:
+      - name: date_key
+        description: "Clave fecha en formato numérico YYYYMMDD"
+        tests:
+          - unique
+          - not_null
+      - name: date_day
+        tests:
+          - unique
+          - not_null
+
+  - name: fct_stock_daily_performance
+    description: "Tabla de hechos con cotizaciones diarias e indicadores de rendimiento"
+    columns:
+      - name: performance_key
+        description: "Clave primaria compuesta (MD5 de symbol + trade_date)"
+        tests:
+          - unique
+          - not_null
+      - name: company_key
+        description: "Clave foránea hacia dim_companies"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_companies')
+              field: company_key
+      - name: date_key
+        description: "Clave foránea hacia dim_date"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_key
+      - name: performance_tier
+        description: "Clasificación de rendimiento bursátil diario"
+        tests:
+          - accepted_values:
+              values: ['Bullish High', 'Bullish Mild', 'Neutral', 'Bearish Mild', 'Bearish High']
+
+  - name: mart_stock_monthly_summary
+    description: "Data Mart agregado con métricas mensuales consolidadas por acción"
+    columns:
+      - name: symbol
+        tests:
+          - not_null
+      - name: year_month
+        tests:
+          - not_null

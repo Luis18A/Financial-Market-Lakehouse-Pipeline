@@ -52,6 +52,7 @@ dbt_financial/target/
 dbt_financial/dbt_packages/
 dbt_financial/logs/
 dbt_financial/profiles.yml
+dbt_financial/.user.yml
 
 # Apache Spark & Hadoop
 metastore_db/

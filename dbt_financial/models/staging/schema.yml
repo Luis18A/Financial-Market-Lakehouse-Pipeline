@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: stg_company_listings
+    description: "Vista de preparación para el catálogo de activos"
+    columns:
+      - name: symbol
+        description: "Ticker o símbolo único de la acción o ETF"
+        tests:
+          - unique
+          - not_null
+      - name: company_name
+        description: "Nombre de la empresa o fondo"
+        tests:
+          - not_null
+
+  - name: stg_stock_prices
+    description: "Vista de preparación para cotizaciones bursátiles"
+    columns:
+      - name: symbol
+        tests:
+          - not_null
+      - name: trade_date
+        tests:
+          - not_null
+      - name: close_price
+        tests:
+          - not_null
