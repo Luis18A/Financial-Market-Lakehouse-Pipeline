@@ -1,5 +1,3 @@
-version: '3.8'
-
 # ==============================================================================
 # Financial Market Lakehouse Pipeline - Docker Compose
 # Arquitectura Medallón: MinIO (S3) + Spark + PostgreSQL + Airflow
@@ -20,9 +18,14 @@ services:
   # ----------------------------------------------------------------------------
   # 1. MinIO: Object Storage compatible con S3 (Data Lake Medallón)
   # ----------------------------------------------------------------------------
+  # 1. MinIO: Object Storage compatible con S3 (Data Lake Medallón)
+  # ----------------------------------------------------------------------------
   minio:
-    image: ${MINIO_IMAGE:-minio/minio:latest}
-    container_name: minio_local
+    image: ${MINIO_IMAGE:-docker-minio:latest}
+    build:
+      context: ./docker/minio
+      dockerfile: Dockerfile
+    container_name: lakehouse_minio
     restart: unless-stopped
     ports:
       - "${MINIO_API_PORT:-9000}:9000"       # S3 API
@@ -33,31 +36,6 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
-    networks:
-      - lakehouse_net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Inicializador automático de buckets (Bronze, Silver, Gold)
-  minio-init-buckets:
-    image: minio/mc:latest
-    container_name: minio_init_buckets
-    depends_on:
-      - minio
-    entrypoint: >
-      /bin/sh -c "
-      echo 'Esperando que MinIO esté disponible...';
-      sleep 3;
-      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin};
-      mc mb --ignore-existing local/${BUCKET_BRONZE:-bronze};
-      mc mb --ignore-existing local/${BUCKET_SILVER:-silver};
-      mc mb --ignore-existing local/${BUCKET_GOLD:-gold};
-      echo 'Buckets listos: ${BUCKET_BRONZE:-bronze}, ${BUCKET_SILVER:-silver}, ${BUCKET_GOLD:-gold}';
-      exit 0;
-      "
     networks:
       - lakehouse_net
 
@@ -88,8 +66,8 @@ services:
   # 3. Apache Spark (Master & Worker): Motor distribuido para capa Silver
   # ----------------------------------------------------------------------------
   spark-master:
-    image: ${SPARK_IMAGE:-bitnami/spark:3.5.0}
-    container_name: spark_master
+    image: ${SPARK_IMAGE:-bitnamilegacy/spark:3.5.0}
+    container_name: lakehouse_spark_master
     restart: unless-stopped
     environment:
       - SPARK_MODE=master
@@ -107,8 +85,8 @@ services:
       - lakehouse_net
 
   spark-worker:
-    image: ${SPARK_IMAGE:-bitnami/spark:3.5.0}
-    container_name: spark_worker
+    image: ${SPARK_IMAGE:-bitnamilegacy/spark:3.5.0}
+    container_name: lakehouse_spark_worker
     restart: unless-stopped
     depends_on:
       - spark-master
@@ -134,7 +112,7 @@ services:
   # ----------------------------------------------------------------------------
   airflow-webserver:
     image: ${AIRFLOW_IMAGE:-apache/airflow:2.8.1-python3.11}
-    container_name: airflow_standalone
+    container_name: lakehouse_airflow
     restart: unless-stopped
     depends_on:
       postgres:
@@ -152,7 +130,7 @@ services:
       - _AIRFLOW_WWW_USER_CREATE=true
       - _AIRFLOW_WWW_USER_USERNAME=${AIRFLOW_ADMIN_USER:-admin}
       - _AIRFLOW_WWW_USER_PASSWORD=${AIRFLOW_ADMIN_PASSWORD:-admin}
-      - _PIP_ADDITIONAL_REQUIREMENTS=dlt[s3] duckdb pyarrow python-dotenv requests pandas psycopg2-binary apache-airflow-providers-apache-spark dbt-core dbt-postgres minio
+      - _PIP_ADDITIONAL_REQUIREMENTS=minio requests pandas pyarrow python-dotenv psycopg2-binary
       # Credenciales y endpoints de MinIO (S3 Compatible)
       - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
       - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}

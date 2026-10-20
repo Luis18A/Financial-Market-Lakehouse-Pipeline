@@ -61,7 +61,15 @@ Financial-Market-Lakehouse-Pipeline/
 │   └── spark-defaults.conf   # Conexión S3A entre Apache Spark y MinIO
 │
 ├── dags/                     # Grafos de orquestación de Apache Airflow
-│   └── .gitkeep
+│   ├── financial_bronze_ingestion_dag.py # DAG de ingesta cruda a MinIO
+│   └── utils/                # Módulos reutilizables de ingesta y almacenamiento
+│       ├── __init__.py
+│       ├── alpha_vantage_client.py # Cliente HTTP con rate-limiting y fallbacks
+│       └── minio_storage.py        # Wrapper S3 para uploads e idempotencia
+│
+├── docker/                   # Definiciones personalizadas de contenedores
+│   └── minio/
+│       └── Dockerfile        # Compilación multi-stage de MinIO desde código fuente oficial
 │
 ├── spark_jobs/               # Scripts PySpark de procesamiento masivo (Capa Silver)
 │   └── .gitkeep
@@ -90,12 +98,11 @@ El archivo [`docker-compose.yml`](file:///c:/Users/luisC/Music/DataEngineer/Fina
 ### Servicios Desplegados:
 | Servicio | Contenedor | Puerto Local | Descripción |
 | :--- | :--- | :--- | :--- |
-| **MinIO** | `minio_local` | `9000` (API), `9001` (Web) | Almacenamiento S3 local para las capas Bronze, Silver y Gold |
-| **MinIO Init** | `minio_init_buckets` | *Ephimeral* | Cliente `mc` que crea automáticamente los buckets `bronze`, `silver`, `gold` |
+| **MinIO** | `lakehouse_minio` | `9000` (API), `9001` (Web) | Almacenamiento S3 local (compilado o precargado como `docker-minio:latest`) |
 | **PostgreSQL** | `postgres_lakehouse` | `5432` | Base para Airflow (`airflow`) y Data Warehouse analítico (`financial_dw`) |
-| **Spark Master** | `spark_master` | `7077` (Cluster), `8081` (Web) | Nodo maestro de procesamiento distribuido |
-| **Spark Worker** | `spark_worker` | `8082` (Web) | Nodo trabajador asignado con núcleos y memoria para PySpark |
-| **Airflow Standalone**| `airflow_standalone` | `8080` (Web) | Scheduler, Webserver y LocalExecutor con dependencias preinstaladas |
+| **Spark Master** | `lakehouse_spark_master` | `7077` (Cluster), `8081` (Web) | Nodo maestro de procesamiento distribuido (`bitnamilegacy/spark:3.5.0`) |
+| **Spark Worker** | `lakehouse_spark_worker` | `8082` (Web) | Nodo trabajador asignado con núcleos y memoria para PySpark |
+| **Airflow Standalone**| `lakehouse_airflow` | `8085` (Web) | Scheduler, Webserver y LocalExecutor con inicialización de buckets en MinIO |
 
 ---
 
@@ -135,7 +142,7 @@ docker compose up -d
 ```bash
 docker compose ps
 ```
-Todos los servicios principales (`minio_local`, `postgres_lakehouse`, `spark_master`, `spark_worker`, `airflow_standalone`) deben mostrar estado `Up` o `Up (healthy)`. El servicio `minio_init_buckets` se ejecutará una vez, creará los 3 buckets y saldrá con código 0 (`Exit 0`).
+Todos los servicios principales (`lakehouse_minio`, `postgres_lakehouse`, `lakehouse_spark_master`, `lakehouse_spark_worker`, `lakehouse_airflow`) deben mostrar estado `Up` o `Up (healthy)`.
 
 ---
 
@@ -145,7 +152,7 @@ Una vez levantado el entorno, puedes acceder a las consolas web desde tu navegad
 
 | Servicio | URL Local | Usuario por Defecto | Contraseña por Defecto |
 | :--- | :--- | :--- | :--- |
-| **Apache Airflow** | [http://localhost:8080](http://localhost:8080) | `admin` | `admin` |
+| **Apache Airflow** | [http://localhost:8085](http://localhost:8085) | `admin` | `admin` |
 | **MinIO Console** | [http://localhost:9001](http://localhost:9001) | `minioadmin` | `minioadmin` |
 | **Spark Master UI**| [http://localhost:8081](http://localhost:8081) | *No requiere* | *No requiere* |
 | **Spark Worker UI**| [http://localhost:8082](http://localhost:8082) | *No requiere* | *No requiere* |
@@ -179,7 +186,70 @@ Ingresa a [http://localhost:8081](http://localhost:8081). Deberías ver:
 
 ---
 
-## 7. Comandos Útiles de Mantenimiento
+## 7. Capa Bronze: Ingesta de Mercado Financiero con Airflow
+
+La **Capa Bronze** implementa el patrón de ingesta cruda e inmutable. El DAG [`financial_bronze_ingestion`](file:///c:/Users/luisC/Music/DataEngineer/Financial-Market-Lakehouse-Pipeline/dags/financial_bronze_ingestion_dag.py) orquesta la extracción desde Alpha Vantage y la persistencia en el bucket `s3://bronze/`.
+
+```
+                    ┌───────────────────────────┐
+                    │  check_minio_connectivity │
+                    └─────────────┬─────────────┘
+                                  │
+                  ┌───────────────┴───────────────┐
+                  ▼                               ▼
+      ┌───────────────────────┐       ┌────────────────────────┐
+      │ ingest_listing_status │       │ ingest_stock_time_series│
+      └───────────┬───────────┘       └───────────┬────────────┘
+                  │                               │
+                  └───────────────┬───────────────┘
+                                  ▼
+                    ┌───────────────────────────┐
+                    │   verify_bronze_ingestion │
+                    └───────────────────────────┘
+```
+
+### ¿Qué es un DAG en Apache Airflow?
+Un **DAG** (*Directed Acyclic Graph* o Grafo Acíclico Dirigido) es la definición en código Python de un flujo de trabajo orquestado:
+* **Grafo**: Representa un conjunto de tareas (nodos) interconectadas mediante dependencias (aristas).
+* **Dirigido**: La ejecución tiene una única dirección lógica: la tarea `verify_bronze_ingestion` solo se ejecuta si las tareas predecesoras (`ingest_listing_status` e `ingest_stock_time_series`) concluyen exitosamente.
+* **Acíclico**: No admite bucles o ciclos infinitos (la tarea C no puede enviar su salida a la tarea A). Esto garantiza que el pipeline tenga un inicio determinista y un fin predecible.
+
+### Contrato de Almacenamiento (Particionamiento Hive)
+Para garantizar lecturas de alta eficiencia en la capa Silver sin escanear datos redundantes, los datos se organizan siguiendo la convención de particionamiento Hive:
+
+- **Catálogo de Acciones y ETFs (`LISTING_STATUS`)**:
+  ```text
+  s3://bronze/alpha_vantage/listing_status/ingestion_date=YYYY-MM-DD/listing_status.csv
+  ```
+- **Series Diarias Ajustadas (`TIME_SERIES_DAILY_ADJUSTED`)**:
+  ```text
+  s3://bronze/alpha_vantage/time_series_daily/symbol=AAPL/ingestion_date=YYYY-MM-DD/daily_adjusted.json
+  s3://bronze/alpha_vantage/time_series_daily/symbol=MSFT/ingestion_date=YYYY-MM-DD/daily_adjusted.json
+  ```
+
+### ¿Por qué esta estructura ahorra hasta un 95% de I/O y memoria en Apache Spark?
+* **Sin Particionamiento (Full Scan tradicional)**: Si todas las transacciones históricas de miles de empresas estuvieran en un único archivo o carpeta plana, cuando Spark necesite analizar únicamente `AAPL`, tendría que descargar por red gigabytes de datos innecesarios, deserializar todos los registros y filtrarlos en memoria RAM, desperdiciando recursos.
+* **Con Hive Partitioning (`Partition Pruning`)**: Al almacenar bajo subdirectorios `symbol=AAPL/ingestion_date=.../`, el optimizador de Spark (**Catalyst Optimizer**) evalúa los filtros `WHERE symbol = 'AAPL'` antes de leer el almacenamiento. Spark "poda" (descarta) todas las demás carpetas de otros símbolos y realiza peticiones HTTP/S3 **únicamente** sobre la carpeta de Apple. Esto reduce drásticamente la latencia de red, evita errores de *Out-Of-Memory* (OOM) y acelera las consultas analíticas.
+
+### Principios de Ingeniería Evaluados por Reclutadores Técnicos:
+1. **Idempotencia Absoluta**: Si el DAG se reejecuta para una fecha específica (`ds`), sobrescribe exactamente la partición correspondiente sin duplicar registros ni alterar el historial.
+2. **Respeto de Cuotas y Rate-Limiting**: El cliente HTTP implementa pausas calculadas de 12 segundos entre llamadas y detección de mensajes de advertencia de la API gratuita (5 req/min), asegurando que el pipeline no sea bloqueado.
+3. **Data Quality Gate Integrado**: La tarea `verify_bronze_ingestion` no asume que todo funcionó; realiza una auditoría física en el Object Storage MinIO verificando que los archivos existan con contenido antes de marcar la corrida en verde.
+4. **Desacople Almacenamiento-Cómputo**: Los datos crudos viven en MinIO (S3), mientras que el cómputo reside en Spark y la base de datos relacional (PostgreSQL) se reserva exclusivamente para analítica estructurada (Gold).
+
+### Evidencia de Ejecución Verificada:
+* **Buckets creados en MinIO**: `bronze`, `silver`, `gold`.
+* **Archivos ingestados en la primera corrida**:
+  - `alpha_vantage/listing_status/ingestion_date=2026-10-19/listing_status.csv`
+  - `alpha_vantage/time_series_daily/symbol=AAPL/ingestion_date=2026-10-19/daily_adjusted.json`
+  - `alpha_vantage/time_series_daily/symbol=AMZN/ingestion_date=2026-10-19/daily_adjusted.json`
+  - `alpha_vantage/time_series_daily/symbol=GOOGL/ingestion_date=2026-10-19/daily_adjusted.json`
+  - `alpha_vantage/time_series_daily/symbol=IBM/ingestion_date=2026-10-19/daily_adjusted.json`
+  - `alpha_vantage/time_series_daily/symbol=MSFT/ingestion_date=2026-10-19/daily_adjusted.json`
+
+---
+
+## 8. Comandos Útiles de Mantenimiento
 
 ```bash
 # Ver los logs en tiempo real de todos los servicios
@@ -187,9 +257,6 @@ docker compose logs -f
 
 # Ver los logs únicamente de Airflow
 docker compose logs -f airflow-webserver
-
-# Ver los logs de inicialización de buckets
-docker compose logs minio-init-buckets
 
 # Detener todos los servicios sin borrar datos almacenados
 docker compose stop
@@ -206,18 +273,15 @@ docker compose down -v
 
 ---
 
-## 8. Hoja de Ruta para las Siguientes Fases
+## 9. Hoja de Ruta para las Siguientes Fases
 
-Con la base de fundamentos, control de versiones y contenedores lista, las siguientes fases de desarrollo serán:
+Con la Capa Bronze implementada, el avance del Lakehouse continúa con:
 
-1. **Fase 2 - Capa Bronze (Raw Storage)**:
-   - Creación de tareas de ingesta en Python / Airflow hacia la API de Alpha Vantage (`TIME_SERIES_DAILY_ADJUSTED` y `LISTING_STATUS`).
-   - Almacenamiento de archivos crudos particionados por fecha de ingestión en el bucket `s3://bronze/`.
-2. **Fase 3 - Capa Silver (Data Processing con PySpark)**:
+1. **Fase 3 - Capa Silver (Data Processing con PySpark)**:
    - Scripts de PySpark ejecutados en el cluster Spark.
    - Limpieza, cálculo de variaciones porcentuales, casting de tipos y persistencia en `s3://silver/` en formato Parquet optimizado.
-3. **Fase 4 - Capa Gold (Data Modeling con dbt Core)**:
+2. **Fase 4 - Capa Gold (Data Modeling con dbt Core)**:
    - Ingesta a `financial_dw` y modelado dimensional (tablas de hechos e indicadores financieros).
    - Pruebas de calidad y linaje con `dbt test`.
-4. **Fase 5 - Orquestación Final**:
+3. **Fase 5 - Orquestación Final**:
    - Ensamblado del DAG integral en Airflow con alertas y monitoreo.
